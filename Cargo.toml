@@ -6,4 +6,4 @@ license = "MIT"
 rust-version = "1.84"
 
 [dependencies]
-zellij-tile = "0.42.2"
+zellij-tile = "0.45.1"

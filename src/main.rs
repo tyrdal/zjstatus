@@ -6,6 +6,10 @@ use zellij_tile::prelude::*;
 #[derive(Default)]
 struct State {
     initialized: bool,
+    /// Keybindings from the InitialKeybinds event; zellij 0.45 sends ModeUpdate
+    /// without them to plugins that subscribe to InitialKeybinds.
+    keybinds: KeybindsVec,
+    startup_resends: u32,
     pipe_name: String,
     mode_info: ModeInfo,
     base_mode_is_locked: bool,
@@ -45,72 +49,37 @@ struct Hint {
 
 register_plugin!(State);
 
-const TO_NORMAL: Action = Action::SwitchToMode(InputMode::Normal);
-
 const PLUGIN_SESSION_MANAGER: &str = "session-manager";
 const PLUGIN_CONFIGURATION: &str = "configuration";
 const PLUGIN_MANAGER: &str = "plugin-manager";
 const PLUGIN_ABOUT: &str = "zellij:about";
 
-const KEY_PATTERNS_NO_SEPARATOR: &[&str] = &["HJKL", "hjkl", "←↓↑→", "←→", "↓↑", "[]"];
+const KEY_PATTERNS_NO_SEPARATOR: &[&str] = &[
+    "HJKL",
+    "hjkl",
+    "←↓↑→",
+    "←→",
+    "↓↑",
+    "[]",
+    "←↓↑→hjkl",
+    "←→hl",
+    "↓↑jk",
+];
+
+/// Display order for direction keys, so "move" reads ←↓↑→hjkl however the
+/// bindings happen to be ordered in the config.
+const DIRECTION_KEY_ORDER: &[&str] = &["←", "↓", "↑", "→", "h", "j", "k", "l"];
 
 const DEFAULT_MAX_LENGTH: usize = 0;
 const DEFAULT_OVERFLOW_STR: &str = "...";
 const DEFAULT_PIPE_NAME: &str = "zjstatus_hints";
+/// How many times (one per second) the hints are resent after loading.
+const STARTUP_RESENDS: u32 = 10;
 const DEFAULT_KEY_BG: &str = "#394260";
 const DEFAULT_KEY_FG: &str = "#ffffff";
 const DEFAULT_DESC_FG: &str = "#a0a9cb";
 const DEFAULT_CAP_LEFT: &str = "\u{e0ba}"; // Powerline Extra: lower-right slant
 const DEFAULT_CAP_RIGHT: &str = "\u{e0bc}"; // Powerline Extra: upper-left slant
-
-type ActionLabel = (Action, &'static str);
-type ActionSequenceLabel = (&'static [Action], &'static str);
-
-const NORMAL_MODE_ACTIONS: &[ActionLabel] = &[
-    (Action::SwitchToMode(InputMode::Pane), "pane"),
-    (Action::SwitchToMode(InputMode::Tab), "tab"),
-    (Action::SwitchToMode(InputMode::Resize), "resize"),
-    (Action::SwitchToMode(InputMode::Move), "move"),
-    (Action::SwitchToMode(InputMode::Scroll), "scroll"),
-    (Action::SwitchToMode(InputMode::Search), "search"),
-    (Action::SwitchToMode(InputMode::Session), "session"),
-    (Action::Quit, "quit"),
-];
-
-const PANE_MODE_ACTION_SEQUENCES: &[ActionSequenceLabel] = &[
-    (&[Action::NewPane(None, None, false), TO_NORMAL], "new"),
-    (&[Action::CloseFocus, TO_NORMAL], "close"),
-    (&[Action::ToggleFocusFullscreen, TO_NORMAL], "fullscreen"),
-    (&[Action::ToggleFloatingPanes, TO_NORMAL], "float"),
-    (&[Action::TogglePaneEmbedOrFloating, TO_NORMAL], "embed"),
-    (
-        &[
-            Action::NewPane(Some(Direction::Right), None, false),
-            TO_NORMAL,
-        ],
-        "split right",
-    ),
-    (
-        &[
-            Action::NewPane(Some(Direction::Down), None, false),
-            TO_NORMAL,
-        ],
-        "split down",
-    ),
-];
-
-const TAB_MODE_ACTION_SEQUENCES: &[ActionSequenceLabel] = &[
-    (
-        &[
-            Action::NewTab(None, vec![], None, None, None, true),
-            TO_NORMAL,
-        ],
-        "new",
-    ),
-    (&[Action::CloseTab, TO_NORMAL], "close"),
-    (&[Action::BreakPane, TO_NORMAL], "break pane"),
-    (&[Action::ToggleActiveSyncTab, TO_NORMAL], "sync"),
-];
 
 fn get_common_modifiers(mut key_bindings: Vec<&KeyWithModifier>) -> Vec<KeyModifier> {
     if key_bindings.is_empty() {
@@ -168,18 +137,49 @@ impl ZellijPlugin for State {
         ]);
 
         set_selectable(false);
-        subscribe(&[EventType::ModeUpdate, EventType::SessionUpdate]);
+        subscribe(&[
+            EventType::ModeUpdate,
+            EventType::SessionUpdate,
+            EventType::Timer,
+            EventType::InitialKeybinds,
+        ]);
+        // zjstatus may not be listening yet when the first hints are sent, and
+        // nothing triggers a resend until the mode changes - so resend once a
+        // second for the first few seconds.
+        set_timeout(1.0);
     }
 
     fn update(&mut self, event: Event) -> bool {
         let mut should_render = !self.initialized;
-        if let Event::ModeUpdate(mode_info) = event {
-            if self.mode_info != mode_info {
+        match event {
+            Event::Timer(_) => {
+                if self.startup_resends < STARTUP_RESENDS {
+                    self.startup_resends += 1;
+                    set_timeout(1.0);
+                    should_render = true;
+                }
+            }
+            // Sent right after subscribing, so the hints work before the first
+            // mode change - a background plugin gets no ModeUpdate until then.
+            Event::InitialKeybinds(keybinds) => {
+                self.keybinds = keybinds;
+                self.mode_info.keybinds = self.keybinds.clone();
                 should_render = true;
             }
-            self.mode_info = mode_info;
-            self.base_mode_is_locked = self.mode_info.base_mode == Some(InputMode::Locked);
-        };
+            Event::ModeUpdate(mut mode_info) => {
+                if mode_info.keybinds.is_empty() {
+                    mode_info.keybinds = self.keybinds.clone();
+                } else {
+                    self.keybinds = mode_info.keybinds.clone();
+                }
+                if self.mode_info != mode_info {
+                    should_render = true;
+                }
+                self.mode_info = mode_info;
+                self.base_mode_is_locked = self.mode_info.base_mode == Some(InputMode::Locked);
+            }
+            _ => {}
+        }
         should_render
     }
 
@@ -279,43 +279,37 @@ fn hints_to_plain(hints: &[Hint]) -> String {
         .collect()
 }
 
-fn find_keys_for_actions(
-    keymap: &[(KeyWithModifier, Vec<Action>)],
-    target_actions: &[Action],
-    exact_match: bool,
-) -> Vec<KeyWithModifier> {
+type Keymap = [(KeyWithModifier, Vec<Action>)];
+
+/// Keys whose list of bound actions satisfies `matches`.
+fn keys_where(keymap: &Keymap, matches: impl Fn(&[Action]) -> bool) -> Vec<KeyWithModifier> {
     keymap
         .iter()
-        .filter_map(|(key, key_actions)| {
-            if exact_match {
-                let matching = key_actions
-                    .iter()
-                    .zip(target_actions)
-                    .filter(|(a, b)| a.shallow_eq(b))
-                    .count();
-                if matching == key_actions.len() && matching == target_actions.len() {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            } else if key_actions.iter().next() == target_actions.iter().next() {
-                Some(key.clone())
-            } else {
-                None
-            }
-        })
+        .filter(|(_, actions)| matches(actions))
+        .map(|(key, _)| key.clone())
         .collect()
 }
 
-fn find_keys_for_action_groups(
-    keymap: &[(KeyWithModifier, Vec<Action>)],
-    action_groups: &[&[Action]],
-) -> Vec<KeyWithModifier> {
-    action_groups
-        .iter()
-        .flat_map(|actions| find_keys_for_actions(keymap, actions, true))
-        .collect()
+/// Keys bound to exactly one action, which satisfies `pred`.
+fn keys_for(keymap: &Keymap, pred: impl Fn(&Action) -> bool) -> Vec<KeyWithModifier> {
+    keys_where(keymap, |actions| actions.len() == 1 && pred(&actions[0]))
 }
+
+/// Keys whose first action satisfies `pred`, e.g. `NewPane; SwitchToMode "normal"`.
+fn keys_starting_with(keymap: &Keymap, pred: impl Fn(&Action) -> bool) -> Vec<KeyWithModifier> {
+    keys_where(keymap, |actions| actions.first().is_some_and(&pred))
+}
+
+fn is_switch_to(action: &Action, mode: InputMode) -> bool {
+    matches!(action, Action::SwitchToMode { input_mode } if *input_mode == mode)
+}
+
+const DIRECTIONS: [Direction; 4] = [
+    Direction::Left,
+    Direction::Down,
+    Direction::Up,
+    Direction::Right,
+];
 
 fn format_modifier_string(modifiers: &[KeyModifier]) -> String {
     if modifiers.is_empty() {
@@ -394,8 +388,8 @@ fn plugin_key(
     })
 }
 
-fn get_select_key(keymap: &[(KeyWithModifier, Vec<Action>)]) -> Vec<KeyWithModifier> {
-    let to_normal_keys = find_keys_for_actions(keymap, &[TO_NORMAL], true);
+fn get_select_key(keymap: &Keymap) -> Vec<KeyWithModifier> {
+    let to_normal_keys = keys_for(keymap, |a| is_switch_to(a, InputMode::Normal));
     if to_normal_keys.contains(&KeyWithModifier::new(BareKey::Enter)) {
         vec![KeyWithModifier::new(BareKey::Enter)]
     } else {
@@ -404,237 +398,261 @@ fn get_select_key(keymap: &[(KeyWithModifier, Vec<Action>)]) -> Vec<KeyWithModif
 }
 
 fn add_hint(parts: &mut Vec<Hint>, keys: &[KeyWithModifier], description: &str) {
+    let keys = compact_keys(keys);
     if !keys.is_empty() {
         parts.push(Hint {
-            keys: format_hint_keys(keys),
+            keys: format_hint_keys(&keys),
             description: description.to_string(),
         });
     }
 }
 
-fn render_hints_for_mode(mode: InputMode, keymap: &[(KeyWithModifier, Vec<Action>)]) -> Vec<Hint> {
+/// Keep a hint short: when an action has plain keys (no modifier), show only
+/// those - in a mode like "pane", `Alt n` next to `n` is just noise. Direction
+/// keys are put in ←↓↑→hjkl order so they collapse into one compact group.
+fn compact_keys(keys: &[KeyWithModifier]) -> Vec<KeyWithModifier> {
+    let plain: Vec<KeyWithModifier> = keys
+        .iter()
+        .filter(|k| k.key_modifiers.is_empty())
+        .cloned()
+        .collect();
+    let mut keys = if plain.is_empty() {
+        keys.to_vec()
+    } else {
+        plain
+    };
+    let rank = |k: &KeyWithModifier| {
+        DIRECTION_KEY_ORDER
+            .iter()
+            .position(|d| *d == k.bare_key.to_string())
+            .unwrap_or(DIRECTION_KEY_ORDER.len())
+    };
+    keys.sort_by_key(rank); // stable: non-direction keys keep their order
+    keys.dedup();
+    keys
+}
+
+fn render_hints_for_mode(mode: InputMode, keymap: &Keymap) -> Vec<Hint> {
     let mut parts = vec![];
     let select_keys = get_select_key(keymap);
+    let hint = |parts: &mut Vec<Hint>, keys: Vec<KeyWithModifier>, label: &str| {
+        add_hint(parts, &keys, label)
+    };
 
     match mode {
         InputMode::Normal => {
-            for (action, label) in NORMAL_MODE_ACTIONS {
-                let keys = find_keys_for_actions(keymap, &[action.clone()], true);
-                add_hint(&mut parts, &keys, label);
+            for (target, label) in [
+                (InputMode::Pane, "pane"),
+                (InputMode::Tab, "tab"),
+                (InputMode::Resize, "resize"),
+                (InputMode::Move, "move"),
+                (InputMode::Scroll, "scroll"),
+                (InputMode::Search, "search"),
+                (InputMode::Session, "session"),
+            ] {
+                hint(
+                    &mut parts,
+                    keys_for(keymap, |a| is_switch_to(a, target)),
+                    label,
+                );
             }
+            hint(
+                &mut parts,
+                keys_for(keymap, |a| matches!(a, Action::Quit)),
+                "quit",
+            );
         }
         InputMode::Pane => {
-            for (actions, label) in PANE_MODE_ACTION_SEQUENCES {
-                let keys = find_keys_for_actions(keymap, actions, false);
-                if !keys.is_empty() {
-                    add_hint(&mut parts, &keys, label);
-                }
-            }
-
-            let rename_keys = find_keys_for_actions(
-                keymap,
-                &[
-                    Action::SwitchToMode(InputMode::RenamePane),
-                    Action::PaneNameInput(vec![0]),
-                ],
-                false,
+            let new_pane = |dir: Option<Direction>| {
+                keys_starting_with(
+                    keymap,
+                    move |a| matches!(a, Action::NewPane { direction, .. } if *direction == dir),
+                )
+            };
+            hint(&mut parts, new_pane(None), "new");
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::CloseFocus)),
+                "close",
             );
-            if !rename_keys.is_empty() {
-                add_hint(&mut parts, &rename_keys, "rename");
-            }
-
-            let focus_keys = find_keys_for_action_groups(
-                keymap,
-                &[
-                    &[Action::MoveFocus(Direction::Left)],
-                    &[Action::MoveFocus(Direction::Down)],
-                    &[Action::MoveFocus(Direction::Up)],
-                    &[Action::MoveFocus(Direction::Right)],
-                ],
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::ToggleFocusFullscreen)),
+                "fullscreen",
             );
-            add_hint(&mut parts, &focus_keys, "move");
-            add_hint(&mut parts, &select_keys, "select");
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::ToggleFloatingPanes)),
+                "float",
+            );
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::TogglePaneEmbedOrFloating)),
+                "embed",
+            );
+            hint(&mut parts, new_pane(Some(Direction::Right)), "split right");
+            hint(&mut parts, new_pane(Some(Direction::Down)), "split down");
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| is_switch_to(a, InputMode::RenamePane)),
+                "rename",
+            );
+            let focus_keys = DIRECTIONS
+                .iter()
+                .flat_map(|d| {
+                    keys_for(
+                        keymap,
+                        |a| matches!(a, Action::MoveFocus { direction } if direction == d),
+                    )
+                })
+                .collect();
+            hint(&mut parts, focus_keys, "move");
+            hint(&mut parts, select_keys, "select");
         }
         InputMode::Tab => {
-            for (actions, label) in TAB_MODE_ACTION_SEQUENCES {
-                let keys = find_keys_for_actions(keymap, actions, false);
-                if !keys.is_empty() {
-                    add_hint(&mut parts, &keys, label);
-                }
-            }
-
-            let rename_keys = find_keys_for_actions(
-                keymap,
-                &[
-                    Action::SwitchToMode(InputMode::RenameTab),
-                    Action::TabNameInput(vec![0]),
-                ],
-                false,
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::NewTab { .. })),
+                "new",
             );
-            if !rename_keys.is_empty() {
-                add_hint(&mut parts, &rename_keys, "rename");
-            }
-
-            let focus_keys_full = find_keys_for_action_groups(
-                keymap,
-                &[&[Action::GoToPreviousTab], &[Action::GoToNextTab]],
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::CloseTab)),
+                "close",
             );
-            let focus_keys = if focus_keys_full.contains(&KeyWithModifier::new(BareKey::Left))
-                && focus_keys_full.contains(&KeyWithModifier::new(BareKey::Right))
-            {
-                vec![
-                    KeyWithModifier::new(BareKey::Left),
-                    KeyWithModifier::new(BareKey::Right),
-                ]
-            } else {
-                focus_keys_full
-            };
-            add_hint(&mut parts, &focus_keys, "move");
-            add_hint(&mut parts, &select_keys, "select");
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::BreakPane)),
+                "break pane",
+            );
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::ToggleActiveSyncTab)),
+                "sync",
+            );
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| is_switch_to(a, InputMode::RenameTab)),
+                "rename",
+            );
+            let mut focus_keys = keys_for(keymap, |a| matches!(a, Action::GoToPreviousTab));
+            focus_keys.extend(keys_for(keymap, |a| matches!(a, Action::GoToNextTab)));
+            let left = KeyWithModifier::new(BareKey::Left);
+            let right = KeyWithModifier::new(BareKey::Right);
+            if focus_keys.contains(&left) && focus_keys.contains(&right) {
+                focus_keys = vec![left, right];
+            }
+            hint(&mut parts, focus_keys, "move");
+            hint(&mut parts, select_keys, "select");
         }
         InputMode::Resize => {
-            let resize_keys = find_keys_for_action_groups(
-                keymap,
-                &[
-                    &[Action::Resize(Resize::Increase, None)],
-                    &[Action::Resize(Resize::Decrease, None)],
-                ],
-            );
-            add_hint(&mut parts, &resize_keys, "resize");
-
-            let increase_keys = find_keys_for_action_groups(
-                keymap,
-                &[
-                    &[Action::Resize(Resize::Increase, Some(Direction::Left))],
-                    &[Action::Resize(Resize::Increase, Some(Direction::Down))],
-                    &[Action::Resize(Resize::Increase, Some(Direction::Up))],
-                    &[Action::Resize(Resize::Increase, Some(Direction::Right))],
-                ],
-            );
-            add_hint(&mut parts, &increase_keys, "increase");
-
-            let decrease_keys = find_keys_for_action_groups(
-                keymap,
-                &[
-                    &[Action::Resize(Resize::Decrease, Some(Direction::Left))],
-                    &[Action::Resize(Resize::Decrease, Some(Direction::Down))],
-                    &[Action::Resize(Resize::Decrease, Some(Direction::Up))],
-                    &[Action::Resize(Resize::Decrease, Some(Direction::Right))],
-                ],
-            );
-            add_hint(&mut parts, &decrease_keys, "decrease");
-            add_hint(&mut parts, &select_keys, "select");
+            let resize = |r: Resize, dir: Option<Direction>| {
+                keys_for(
+                    keymap,
+                    move |a| matches!(a, Action::Resize { resize, direction } if *resize == r && *direction == dir),
+                )
+            };
+            let mut both = resize(Resize::Increase, None);
+            both.extend(resize(Resize::Decrease, None));
+            hint(&mut parts, both, "resize");
+            for (r, label) in [
+                (Resize::Increase, "increase"),
+                (Resize::Decrease, "decrease"),
+            ] {
+                let keys = DIRECTIONS
+                    .iter()
+                    .flat_map(|d| resize(r, Some(*d)))
+                    .collect();
+                hint(&mut parts, keys, label);
+            }
+            hint(&mut parts, select_keys, "select");
         }
         InputMode::Move => {
-            let move_keys = find_keys_for_action_groups(
-                keymap,
-                &[
-                    &[Action::MovePane(Some(Direction::Left))],
-                    &[Action::MovePane(Some(Direction::Down))],
-                    &[Action::MovePane(Some(Direction::Up))],
-                    &[Action::MovePane(Some(Direction::Right))],
-                ],
-            );
-            add_hint(&mut parts, &move_keys, "move");
-            add_hint(&mut parts, &select_keys, "select");
+            let keys = DIRECTIONS
+                .iter()
+                .flat_map(|d| {
+                    keys_for(
+                        keymap,
+                        |a| matches!(a, Action::MovePane { direction: Some(x) } if x == d),
+                    )
+                })
+                .collect();
+            hint(&mut parts, keys, "move");
+            hint(&mut parts, select_keys, "select");
         }
-        InputMode::Scroll => {
-            let search_keys = find_keys_for_actions(
-                keymap,
-                &[
-                    Action::SwitchToMode(InputMode::EnterSearch),
-                    Action::SearchInput(vec![0]),
-                ],
-                true,
+        InputMode::Scroll | InputMode::Search => {
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| is_switch_to(a, InputMode::EnterSearch)),
+                "search",
             );
-            add_hint(&mut parts, &search_keys, "search");
-
-            let scroll_keys =
-                find_keys_for_action_groups(keymap, &[&[Action::ScrollDown], &[Action::ScrollUp]]);
-            add_hint(&mut parts, &scroll_keys, "scroll");
-
-            let page_scroll_keys = find_keys_for_action_groups(
-                keymap,
-                &[&[Action::PageScrollDown], &[Action::PageScrollUp]],
+            let pair = |a1: fn(&Action) -> bool, a2: fn(&Action) -> bool| {
+                let mut keys = keys_for(keymap, a1);
+                keys.extend(keys_for(keymap, a2));
+                keys
+            };
+            hint(
+                &mut parts,
+                pair(
+                    |a| matches!(a, Action::ScrollDown),
+                    |a| matches!(a, Action::ScrollUp),
+                ),
+                "scroll",
             );
-            add_hint(&mut parts, &page_scroll_keys, "page");
-
-            let half_page_scroll_keys = find_keys_for_action_groups(
-                keymap,
-                &[&[Action::HalfPageScrollDown], &[Action::HalfPageScrollUp]],
+            hint(
+                &mut parts,
+                pair(
+                    |a| matches!(a, Action::PageScrollDown),
+                    |a| matches!(a, Action::PageScrollUp),
+                ),
+                "page",
             );
-            add_hint(&mut parts, &half_page_scroll_keys, "half page");
-
-            let edit_keys =
-                find_keys_for_actions(keymap, &[Action::EditScrollback, TO_NORMAL], false);
-            if !edit_keys.is_empty() {
-                add_hint(&mut parts, &edit_keys, "edit");
+            hint(
+                &mut parts,
+                pair(
+                    |a| matches!(a, Action::HalfPageScrollDown),
+                    |a| matches!(a, Action::HalfPageScrollUp),
+                ),
+                "half page",
+            );
+            if mode == InputMode::Scroll {
+                hint(
+                    &mut parts,
+                    keys_starting_with(keymap, |a| matches!(a, Action::EditScrollback { .. })),
+                    "edit",
+                );
+            } else {
+                for (dir, label) in [(SearchDirection::Down, "down"), (SearchDirection::Up, "up")] {
+                    let keys = keys_for(
+                        keymap,
+                        move |a| matches!(a, Action::Search { direction, .. } if *direction == dir),
+                    );
+                    hint(&mut parts, keys, label);
+                }
             }
-            add_hint(&mut parts, &select_keys, "select");
-        }
-        InputMode::Search => {
-            let search_keys = find_keys_for_actions(
-                keymap,
-                &[
-                    Action::SwitchToMode(InputMode::EnterSearch),
-                    Action::SearchInput(vec![0]),
-                ],
-                true,
-            );
-            add_hint(&mut parts, &search_keys, "search");
-
-            let scroll_keys =
-                find_keys_for_action_groups(keymap, &[&[Action::ScrollDown], &[Action::ScrollUp]]);
-            add_hint(&mut parts, &scroll_keys, "scroll");
-
-            let page_scroll_keys = find_keys_for_action_groups(
-                keymap,
-                &[&[Action::PageScrollDown], &[Action::PageScrollUp]],
-            );
-            add_hint(&mut parts, &page_scroll_keys, "page");
-
-            let half_page_scroll_keys = find_keys_for_action_groups(
-                keymap,
-                &[&[Action::HalfPageScrollDown], &[Action::HalfPageScrollUp]],
-            );
-            add_hint(&mut parts, &half_page_scroll_keys, "half page");
-
-            let down_keys =
-                find_keys_for_actions(keymap, &[Action::Search(SearchDirection::Down)], true);
-            add_hint(&mut parts, &down_keys, "down");
-
-            let up_keys =
-                find_keys_for_actions(keymap, &[Action::Search(SearchDirection::Up)], true);
-            add_hint(&mut parts, &up_keys, "up");
-
-            add_hint(&mut parts, &select_keys, "select");
+            hint(&mut parts, select_keys, "select");
         }
         InputMode::Session => {
-            let detach_keys = find_keys_for_actions(keymap, &[Action::Detach], true);
-            add_hint(&mut parts, &detach_keys, "detach");
-
-            if let Some(manager_key) = plugin_key(keymap, PLUGIN_SESSION_MANAGER) {
-                add_hint(&mut parts, &[manager_key], "manager");
+            hint(
+                &mut parts,
+                keys_for(keymap, |a| matches!(a, Action::Detach)),
+                "detach",
+            );
+            for (plugin, label) in [
+                (PLUGIN_SESSION_MANAGER, "manager"),
+                (PLUGIN_CONFIGURATION, "config"),
+                (PLUGIN_MANAGER, "plugins"),
+                (PLUGIN_ABOUT, "about"),
+            ] {
+                if let Some(key) = plugin_key(keymap, plugin) {
+                    hint(&mut parts, vec![key], label);
+                }
             }
-
-            if let Some(config_key) = plugin_key(keymap, PLUGIN_CONFIGURATION) {
-                add_hint(&mut parts, &[config_key], "config");
-            }
-
-            if let Some(plugin_key_val) = plugin_key(keymap, PLUGIN_MANAGER) {
-                add_hint(&mut parts, &[plugin_key_val], "plugins");
-            }
-
-            if let Some(about_key) = plugin_key(keymap, PLUGIN_ABOUT) {
-                add_hint(&mut parts, &[about_key], "about");
-            }
-
-            add_hint(&mut parts, &select_keys, "select");
+            hint(&mut parts, select_keys, "select");
         }
         _ => {
-            let keys =
-                find_keys_for_actions(keymap, &[Action::SwitchToMode(InputMode::Normal)], true);
-            add_hint(&mut parts, &keys, "normal");
+            let keys = keys_for(keymap, |a| is_switch_to(a, InputMode::Normal));
+            hint(&mut parts, keys, "normal");
         }
     }
 
