@@ -1,13 +1,7 @@
-use ansi_term::{
-    ANSIString, ANSIStrings,
-    Colour::{Fixed, RGB},
-    Style,
-};
 use std::collections::BTreeMap;
 use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::actions::SearchDirection;
 use zellij_tile::prelude::*;
-use zellij_tile_utils::palette_match;
 
 #[derive(Default)]
 struct State {
@@ -18,6 +12,35 @@ struct State {
     max_length: usize,
     overflow_str: String,
     hide_in_base_mode: bool,
+    style: HintStyle,
+}
+
+/// How one key segment is drawn. Colours are anything zjstatus understands in
+/// `#[fg=...]`: `#rrggbb`, a colour name, or a `$alias` from the zjstatus config.
+struct HintStyle {
+    key_bg: String,
+    key_fg: String,
+    desc_fg: String,
+    cap_left: String,
+    cap_right: String,
+}
+
+impl Default for HintStyle {
+    fn default() -> Self {
+        Self {
+            key_bg: DEFAULT_KEY_BG.to_string(),
+            key_fg: DEFAULT_KEY_FG.to_string(),
+            desc_fg: DEFAULT_DESC_FG.to_string(),
+            cap_left: DEFAULT_CAP_LEFT.to_string(),
+            cap_right: DEFAULT_CAP_RIGHT.to_string(),
+        }
+    }
+}
+
+/// One hint: the key text (e.g. "Ctrl + p" or "h|j|k|l") and what it does.
+struct Hint {
+    keys: String,
+    description: String,
 }
 
 register_plugin!(State);
@@ -34,6 +57,11 @@ const KEY_PATTERNS_NO_SEPARATOR: &[&str] = &["HJKL", "hjkl", "←↓↑→", "�
 const DEFAULT_MAX_LENGTH: usize = 0;
 const DEFAULT_OVERFLOW_STR: &str = "...";
 const DEFAULT_PIPE_NAME: &str = "zjstatus_hints";
+const DEFAULT_KEY_BG: &str = "#394260";
+const DEFAULT_KEY_FG: &str = "#ffffff";
+const DEFAULT_DESC_FG: &str = "#a0a9cb";
+const DEFAULT_CAP_LEFT: &str = "\u{e0ba}"; // Powerline Extra: lower-right slant
+const DEFAULT_CAP_RIGHT: &str = "\u{e0bc}"; // Powerline Extra: upper-left slant
 
 type ActionLabel = (Action, &'static str);
 type ActionSequenceLabel = (&'static [Action], &'static str);
@@ -120,6 +148,20 @@ impl ZellijPlugin for State {
             .map(|s| s.to_lowercase().parse::<bool>().unwrap_or(false))
             .unwrap_or(false);
 
+        let get = |key: &str, default: &str| {
+            configuration
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| default.to_string())
+        };
+        self.style = HintStyle {
+            key_bg: get("key_bg", DEFAULT_KEY_BG),
+            key_fg: get("key_fg", DEFAULT_KEY_FG),
+            desc_fg: get("desc_fg", DEFAULT_DESC_FG),
+            cap_left: get("cap_left", DEFAULT_CAP_LEFT),
+            cap_right: get("cap_right", DEFAULT_CAP_RIGHT),
+        };
+
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::MessageAndLaunchOtherPlugins,
@@ -143,120 +185,98 @@ impl ZellijPlugin for State {
 
     fn render(&mut self, _rows: usize, _cols: usize) {
         let mode_info = &self.mode_info;
-        let output = if !(self.hide_in_base_mode && Some(mode_info.mode) == mode_info.base_mode) {
+        let hints = if !(self.hide_in_base_mode && Some(mode_info.mode) == mode_info.base_mode) {
             let keymap = get_keymap_for_mode(mode_info);
-            let parts = render_hints_for_mode(mode_info.mode, &keymap, &mode_info.style.colors);
-
-            let ansi_strings = ANSIStrings(&parts);
-            let formatted = format!(" {}", ansi_strings);
-
-            let visible_len = calculate_visible_length(&formatted);
-            if self.max_length > 0 && visible_len > self.max_length {
-                truncate_ansi_string(&formatted, &self.overflow_str, self.max_length)
-            } else {
-                formatted.to_string()
-            }
+            fit_hints(
+                render_hints_for_mode(mode_info.mode, &keymap),
+                self.max_length,
+            )
         } else {
-            String::new()
+            vec![]
         };
+        let truncated = hints.len() < self.hint_count();
+        let mut markup = hints_to_markup(&hints, &self.style);
+        let mut plain = hints_to_plain(&hints);
+        if truncated {
+            markup.push_str(&format!(
+                "#[fg={}]{}",
+                self.style.desc_fg, self.overflow_str
+            ));
+            plain.push_str(&self.overflow_str);
+        }
 
         // HACK: Because we're not sure when zjstatus will be ready to receive messages,
         // we'll repeatedly send messages until the user has switched to a different mode,
         // at which point we'll assume that zjstatus has been initialized. The render function
         // does not seem to be called too frequently, so this should be fine.
-        if !output.is_empty() && Some(mode_info.mode) != mode_info.base_mode {
+        if !markup.is_empty() && Some(mode_info.mode) != mode_info.base_mode {
             self.initialized = true;
         }
 
         pipe_message_to_plugin(MessageToPlugin::new("pipe").with_payload(format!(
             "zjstatus::pipe::pipe_{}::{}",
-            self.pipe_name, output
+            self.pipe_name, markup
         )));
-        print!("{}", output);
+        print!("{}", plain);
     }
 }
 
-struct AnsiParser<'a> {
-    chars: std::iter::Peekable<std::str::Chars<'a>>,
-}
-
-impl<'a> AnsiParser<'a> {
-    fn new(text: &'a str) -> Self {
-        Self {
-            chars: text.chars().peekable(),
+impl State {
+    /// Number of hints for the current mode before any truncation.
+    fn hint_count(&self) -> usize {
+        if self.hide_in_base_mode && Some(self.mode_info.mode) == self.mode_info.base_mode {
+            return 0;
         }
-    }
-
-    fn next_segment(&mut self) -> Option<AnsiSegment> {
-        let ch = self.chars.next()?;
-
-        if ch == '\x1b' {
-            let mut escape_seq = String::from(ch);
-            for escape_ch in self.chars.by_ref() {
-                escape_seq.push(escape_ch);
-                if escape_ch == 'm' {
-                    break;
-                }
-            }
-            Some(AnsiSegment::EscapeSequence(escape_seq))
-        } else {
-            Some(AnsiSegment::VisibleChar(ch))
-        }
+        let keymap = get_keymap_for_mode(&self.mode_info);
+        render_hints_for_mode(self.mode_info.mode, &keymap).len()
     }
 }
 
-enum AnsiSegment {
-    EscapeSequence(String),
-    VisibleChar(char),
+/// Visible width of one hint as drawn: " " cap " keys " cap " description".
+fn hint_width(hint: &Hint) -> usize {
+    1 + 1 + hint.keys.chars().count() + 2 + 1 + 1 + hint.description.chars().count()
 }
 
-fn calculate_visible_length(text: &str) -> usize {
-    let mut parser = AnsiParser::new(text);
-    let mut len = 0;
-
-    while let Some(segment) = parser.next_segment() {
-        if matches!(segment, AnsiSegment::VisibleChar(_)) {
-            len += 1;
-        }
+/// Keep whole hints while they fit in `max_length` columns (0 = no limit).
+fn fit_hints(hints: Vec<Hint>, max_length: usize) -> Vec<Hint> {
+    if max_length == 0 {
+        return hints;
     }
-
-    len
+    let mut used = 0;
+    hints
+        .into_iter()
+        .take_while(|hint| {
+            used += hint_width(hint);
+            used <= max_length
+        })
+        .collect()
 }
 
-fn truncate_ansi_string(text: &str, overflow_str: &str, max_len: usize) -> String {
-    let visible_len = calculate_visible_length(text);
-    let overflow_len = overflow_str.len();
+/// zjstatus markup for the pipe; render it with `pipe_<name>_rendermode "dynamic"`.
+fn hints_to_markup(hints: &[Hint], style: &HintStyle) -> String {
+    hints
+        .iter()
+        .map(|hint| {
+            format!(
+                " #[fg={bg}]{cl}#[bg={bg},fg={fg},bold] {keys} #[fg={bg}]{cr}#[fg={desc}] {d}",
+                bg = style.key_bg,
+                fg = style.key_fg,
+                desc = style.desc_fg,
+                cl = style.cap_left,
+                cr = style.cap_right,
+                keys = hint.keys,
+                d = hint.description,
+            )
+        })
+        .collect()
+}
 
-    if visible_len <= max_len {
-        return text.to_string();
-    }
-
-    if max_len <= overflow_len {
-        return overflow_str.to_string();
-    }
-
-    let target_len = max_len - overflow_len;
-    let mut result = String::new();
-    let mut visible_count = 0;
-    let mut parser = AnsiParser::new(text);
-
-    while let Some(segment) = parser.next_segment() {
-        match segment {
-            AnsiSegment::EscapeSequence(seq) => {
-                result.push_str(&seq);
-            }
-            AnsiSegment::VisibleChar(ch) => {
-                if visible_count >= target_len {
-                    break;
-                }
-                result.push(ch);
-                visible_count += 1;
-            }
-        }
-    }
-
-    result.push_str(overflow_str);
-    result
+/// Plain text for the plugin's own (normally hidden) pane.
+fn hints_to_plain(hints: &[Hint]) -> String {
+    hints
+        .iter()
+        .map(|hint| format!(" <{}> {}", hint.keys, hint.description))
+        .collect()
 }
 
 fn find_keys_for_actions(
@@ -345,68 +365,17 @@ fn get_key_separator(key_display: &[String]) -> &'static str {
     }
 }
 
-fn style_key_with_modifier(
-    key_bindings: &[KeyWithModifier],
-    palette: &Styling,
-) -> Vec<ANSIString<'static>> {
-    if key_bindings.is_empty() {
-        return vec![];
-    }
-
-    let saturated_bg = palette_match!(palette.ribbon_unselected.background);
-    let contrasting_fg = palette_match!(palette.ribbon_unselected.base);
-    let mut styled_parts = vec![];
-
+/// "Ctrl + p", "h|j|k|l", "Alt + ←↓↑→": shared modifiers once, then the keys.
+fn format_hint_keys(key_bindings: &[KeyWithModifier]) -> String {
     let common_modifiers = get_common_modifiers(key_bindings.iter().collect());
     let modifier_str = format_modifier_string(&common_modifiers);
     let key_display = format_key_display(key_bindings, &common_modifiers);
-    let key_separator = get_key_separator(&key_display);
-
-    styled_parts.push(Style::new().paint(" "));
-
-    if !modifier_str.is_empty() {
-        styled_parts.push(
-            Style::new()
-                .fg(contrasting_fg)
-                .on(saturated_bg)
-                .bold()
-                .paint(format!(" {} + ", modifier_str)),
-        );
+    let keys = key_display.join(get_key_separator(&key_display));
+    if modifier_str.is_empty() {
+        keys
     } else {
-        styled_parts.push(Style::new().fg(contrasting_fg).on(saturated_bg).paint(" "));
+        format!("{} + {}", modifier_str, keys)
     }
-
-    for (idx, key) in key_display.iter().enumerate() {
-        if idx > 0 && !key_separator.is_empty() {
-            styled_parts.push(
-                Style::new()
-                    .fg(contrasting_fg)
-                    .on(saturated_bg)
-                    .paint(key_separator),
-            );
-        }
-        styled_parts.push(
-            Style::new()
-                .fg(contrasting_fg)
-                .on(saturated_bg)
-                .bold()
-                .paint(key.clone()),
-        );
-    }
-
-    styled_parts.push(Style::new().fg(contrasting_fg).on(saturated_bg).paint(" "));
-
-    styled_parts
-}
-
-fn style_description(description: &str, palette: &Styling) -> Vec<ANSIString<'static>> {
-    let less_saturated_bg = palette_match!(palette.text_unselected.background);
-    let contrasting_fg = palette_match!(palette.text_unselected.base);
-
-    vec![Style::new()
-        .fg(contrasting_fg)
-        .on(less_saturated_bg)
-        .paint(format!(" {} ", description))]
 }
 
 fn plugin_key(
@@ -434,25 +403,16 @@ fn get_select_key(keymap: &[(KeyWithModifier, Vec<Action>)]) -> Vec<KeyWithModif
     }
 }
 
-fn add_hint(
-    parts: &mut Vec<ANSIString<'static>>,
-    keys: &[KeyWithModifier],
-    description: &str,
-    colors: &Styling,
-) {
+fn add_hint(parts: &mut Vec<Hint>, keys: &[KeyWithModifier], description: &str) {
     if !keys.is_empty() {
-        let styled_keys = style_key_with_modifier(keys, colors);
-        parts.extend(styled_keys);
-        let styled_desc = style_description(description, colors);
-        parts.extend(styled_desc);
+        parts.push(Hint {
+            keys: format_hint_keys(keys),
+            description: description.to_string(),
+        });
     }
 }
 
-fn render_hints_for_mode(
-    mode: InputMode,
-    keymap: &[(KeyWithModifier, Vec<Action>)],
-    colors: &Styling,
-) -> Vec<ANSIString<'static>> {
+fn render_hints_for_mode(mode: InputMode, keymap: &[(KeyWithModifier, Vec<Action>)]) -> Vec<Hint> {
     let mut parts = vec![];
     let select_keys = get_select_key(keymap);
 
@@ -460,14 +420,14 @@ fn render_hints_for_mode(
         InputMode::Normal => {
             for (action, label) in NORMAL_MODE_ACTIONS {
                 let keys = find_keys_for_actions(keymap, &[action.clone()], true);
-                add_hint(&mut parts, &keys, label, colors);
+                add_hint(&mut parts, &keys, label);
             }
         }
         InputMode::Pane => {
             for (actions, label) in PANE_MODE_ACTION_SEQUENCES {
                 let keys = find_keys_for_actions(keymap, actions, false);
                 if !keys.is_empty() {
-                    add_hint(&mut parts, &keys, label, colors);
+                    add_hint(&mut parts, &keys, label);
                 }
             }
 
@@ -480,7 +440,7 @@ fn render_hints_for_mode(
                 false,
             );
             if !rename_keys.is_empty() {
-                add_hint(&mut parts, &rename_keys, "rename", colors);
+                add_hint(&mut parts, &rename_keys, "rename");
             }
 
             let focus_keys = find_keys_for_action_groups(
@@ -492,14 +452,14 @@ fn render_hints_for_mode(
                     &[Action::MoveFocus(Direction::Right)],
                 ],
             );
-            add_hint(&mut parts, &focus_keys, "move", colors);
-            add_hint(&mut parts, &select_keys, "select", colors);
+            add_hint(&mut parts, &focus_keys, "move");
+            add_hint(&mut parts, &select_keys, "select");
         }
         InputMode::Tab => {
             for (actions, label) in TAB_MODE_ACTION_SEQUENCES {
                 let keys = find_keys_for_actions(keymap, actions, false);
                 if !keys.is_empty() {
-                    add_hint(&mut parts, &keys, label, colors);
+                    add_hint(&mut parts, &keys, label);
                 }
             }
 
@@ -512,7 +472,7 @@ fn render_hints_for_mode(
                 false,
             );
             if !rename_keys.is_empty() {
-                add_hint(&mut parts, &rename_keys, "rename", colors);
+                add_hint(&mut parts, &rename_keys, "rename");
             }
 
             let focus_keys_full = find_keys_for_action_groups(
@@ -529,8 +489,8 @@ fn render_hints_for_mode(
             } else {
                 focus_keys_full
             };
-            add_hint(&mut parts, &focus_keys, "move", colors);
-            add_hint(&mut parts, &select_keys, "select", colors);
+            add_hint(&mut parts, &focus_keys, "move");
+            add_hint(&mut parts, &select_keys, "select");
         }
         InputMode::Resize => {
             let resize_keys = find_keys_for_action_groups(
@@ -540,7 +500,7 @@ fn render_hints_for_mode(
                     &[Action::Resize(Resize::Decrease, None)],
                 ],
             );
-            add_hint(&mut parts, &resize_keys, "resize", colors);
+            add_hint(&mut parts, &resize_keys, "resize");
 
             let increase_keys = find_keys_for_action_groups(
                 keymap,
@@ -551,7 +511,7 @@ fn render_hints_for_mode(
                     &[Action::Resize(Resize::Increase, Some(Direction::Right))],
                 ],
             );
-            add_hint(&mut parts, &increase_keys, "increase", colors);
+            add_hint(&mut parts, &increase_keys, "increase");
 
             let decrease_keys = find_keys_for_action_groups(
                 keymap,
@@ -562,8 +522,8 @@ fn render_hints_for_mode(
                     &[Action::Resize(Resize::Decrease, Some(Direction::Right))],
                 ],
             );
-            add_hint(&mut parts, &decrease_keys, "decrease", colors);
-            add_hint(&mut parts, &select_keys, "select", colors);
+            add_hint(&mut parts, &decrease_keys, "decrease");
+            add_hint(&mut parts, &select_keys, "select");
         }
         InputMode::Move => {
             let move_keys = find_keys_for_action_groups(
@@ -575,8 +535,8 @@ fn render_hints_for_mode(
                     &[Action::MovePane(Some(Direction::Right))],
                 ],
             );
-            add_hint(&mut parts, &move_keys, "move", colors);
-            add_hint(&mut parts, &select_keys, "select", colors);
+            add_hint(&mut parts, &move_keys, "move");
+            add_hint(&mut parts, &select_keys, "select");
         }
         InputMode::Scroll => {
             let search_keys = find_keys_for_actions(
@@ -587,30 +547,30 @@ fn render_hints_for_mode(
                 ],
                 true,
             );
-            add_hint(&mut parts, &search_keys, "search", colors);
+            add_hint(&mut parts, &search_keys, "search");
 
             let scroll_keys =
                 find_keys_for_action_groups(keymap, &[&[Action::ScrollDown], &[Action::ScrollUp]]);
-            add_hint(&mut parts, &scroll_keys, "scroll", colors);
+            add_hint(&mut parts, &scroll_keys, "scroll");
 
             let page_scroll_keys = find_keys_for_action_groups(
                 keymap,
                 &[&[Action::PageScrollDown], &[Action::PageScrollUp]],
             );
-            add_hint(&mut parts, &page_scroll_keys, "page", colors);
+            add_hint(&mut parts, &page_scroll_keys, "page");
 
             let half_page_scroll_keys = find_keys_for_action_groups(
                 keymap,
                 &[&[Action::HalfPageScrollDown], &[Action::HalfPageScrollUp]],
             );
-            add_hint(&mut parts, &half_page_scroll_keys, "half page", colors);
+            add_hint(&mut parts, &half_page_scroll_keys, "half page");
 
             let edit_keys =
                 find_keys_for_actions(keymap, &[Action::EditScrollback, TO_NORMAL], false);
             if !edit_keys.is_empty() {
-                add_hint(&mut parts, &edit_keys, "edit", colors);
+                add_hint(&mut parts, &edit_keys, "edit");
             }
-            add_hint(&mut parts, &select_keys, "select", colors);
+            add_hint(&mut parts, &select_keys, "select");
         }
         InputMode::Search => {
             let search_keys = find_keys_for_actions(
@@ -621,60 +581,60 @@ fn render_hints_for_mode(
                 ],
                 true,
             );
-            add_hint(&mut parts, &search_keys, "search", colors);
+            add_hint(&mut parts, &search_keys, "search");
 
             let scroll_keys =
                 find_keys_for_action_groups(keymap, &[&[Action::ScrollDown], &[Action::ScrollUp]]);
-            add_hint(&mut parts, &scroll_keys, "scroll", colors);
+            add_hint(&mut parts, &scroll_keys, "scroll");
 
             let page_scroll_keys = find_keys_for_action_groups(
                 keymap,
                 &[&[Action::PageScrollDown], &[Action::PageScrollUp]],
             );
-            add_hint(&mut parts, &page_scroll_keys, "page", colors);
+            add_hint(&mut parts, &page_scroll_keys, "page");
 
             let half_page_scroll_keys = find_keys_for_action_groups(
                 keymap,
                 &[&[Action::HalfPageScrollDown], &[Action::HalfPageScrollUp]],
             );
-            add_hint(&mut parts, &half_page_scroll_keys, "half page", colors);
+            add_hint(&mut parts, &half_page_scroll_keys, "half page");
 
             let down_keys =
                 find_keys_for_actions(keymap, &[Action::Search(SearchDirection::Down)], true);
-            add_hint(&mut parts, &down_keys, "down", colors);
+            add_hint(&mut parts, &down_keys, "down");
 
             let up_keys =
                 find_keys_for_actions(keymap, &[Action::Search(SearchDirection::Up)], true);
-            add_hint(&mut parts, &up_keys, "up", colors);
+            add_hint(&mut parts, &up_keys, "up");
 
-            add_hint(&mut parts, &select_keys, "select", colors);
+            add_hint(&mut parts, &select_keys, "select");
         }
         InputMode::Session => {
             let detach_keys = find_keys_for_actions(keymap, &[Action::Detach], true);
-            add_hint(&mut parts, &detach_keys, "detach", colors);
+            add_hint(&mut parts, &detach_keys, "detach");
 
             if let Some(manager_key) = plugin_key(keymap, PLUGIN_SESSION_MANAGER) {
-                add_hint(&mut parts, &[manager_key], "manager", colors);
+                add_hint(&mut parts, &[manager_key], "manager");
             }
 
             if let Some(config_key) = plugin_key(keymap, PLUGIN_CONFIGURATION) {
-                add_hint(&mut parts, &[config_key], "config", colors);
+                add_hint(&mut parts, &[config_key], "config");
             }
 
             if let Some(plugin_key_val) = plugin_key(keymap, PLUGIN_MANAGER) {
-                add_hint(&mut parts, &[plugin_key_val], "plugins", colors);
+                add_hint(&mut parts, &[plugin_key_val], "plugins");
             }
 
             if let Some(about_key) = plugin_key(keymap, PLUGIN_ABOUT) {
-                add_hint(&mut parts, &[about_key], "about", colors);
+                add_hint(&mut parts, &[about_key], "about");
             }
 
-            add_hint(&mut parts, &select_keys, "select", colors);
+            add_hint(&mut parts, &select_keys, "select");
         }
         _ => {
             let keys =
                 find_keys_for_actions(keymap, &[Action::SwitchToMode(InputMode::Normal)], true);
-            add_hint(&mut parts, &keys, "normal", colors);
+            add_hint(&mut parts, &keys, "normal");
         }
     }
 
