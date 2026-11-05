@@ -9,7 +9,11 @@ struct State {
     /// Keybindings from the InitialKeybinds event; zellij 0.45 sends ModeUpdate
     /// without them to plugins that subscribe to InitialKeybinds.
     keybinds: KeybindsVec,
-    startup_resends: u32,
+    /// Resends still to do, one per second (see `schedule_resends`).
+    resends_left: u32,
+    timer_running: bool,
+    /// Number of tabs at the last TabUpdate, to notice new tabs.
+    tab_count: usize,
     pipe_name: String,
     mode_info: ModeInfo,
     base_mode_is_locked: bool,
@@ -75,6 +79,8 @@ const DEFAULT_OVERFLOW_STR: &str = "...";
 const DEFAULT_PIPE_NAME: &str = "zjstatus_hints";
 /// How many times (one per second) the hints are resent after loading.
 const STARTUP_RESENDS: u32 = 10;
+/// How many times (one per second) the hints are resent when a tab is opened.
+const NEW_TAB_RESENDS: u32 = 5;
 const DEFAULT_KEY_BG: &str = "#394260";
 const DEFAULT_KEY_FG: &str = "#ffffff";
 const DEFAULT_DESC_FG: &str = "#a0a9cb";
@@ -142,21 +148,37 @@ impl ZellijPlugin for State {
             EventType::SessionUpdate,
             EventType::Timer,
             EventType::InitialKeybinds,
+            EventType::TabUpdate,
         ]);
         // zjstatus may not be listening yet when the first hints are sent, and
         // nothing triggers a resend until the mode changes - so resend once a
         // second for the first few seconds.
-        set_timeout(1.0);
+        self.schedule_resends(STARTUP_RESENDS);
     }
 
     fn update(&mut self, event: Event) -> bool {
         let mut should_render = !self.initialized;
         match event {
             Event::Timer(_) => {
-                if self.startup_resends < STARTUP_RESENDS {
-                    self.startup_resends += 1;
-                    set_timeout(1.0);
+                self.timer_running = false;
+                if self.resends_left > 0 {
+                    self.resends_left -= 1;
                     should_render = true;
+                    if self.resends_left > 0 {
+                        set_timeout(1.0);
+                        self.timer_running = true;
+                    }
+                }
+            }
+            // A new tab brings a new zjstatus instance with no hints yet, and it
+            // may still be starting - resend now and for a few more seconds.
+            Event::TabUpdate(tabs) => {
+                if tabs.len() != self.tab_count {
+                    if tabs.len() > self.tab_count && self.tab_count > 0 {
+                        self.schedule_resends(NEW_TAB_RESENDS);
+                        should_render = true;
+                    }
+                    self.tab_count = tabs.len();
                 }
             }
             // Sent right after subscribing, so the hints work before the first
@@ -222,6 +244,15 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    /// Resend the hints once a second, `count` times (restarts any countdown).
+    fn schedule_resends(&mut self, count: u32) {
+        self.resends_left = self.resends_left.max(count);
+        if !self.timer_running {
+            set_timeout(1.0);
+            self.timer_running = true;
+        }
+    }
+
     /// Number of hints for the current mode before any truncation.
     fn hint_count(&self) -> usize {
         if self.hide_in_base_mode && Some(self.mode_info.mode) == self.mode_info.base_mode {
