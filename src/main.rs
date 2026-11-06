@@ -757,6 +757,11 @@ fn render_hints_for_mode(mode: InputMode, keymap: &Keymap) -> Vec<Hint> {
             );
             hint(
                 &mut parts,
+                keys_starting_with(keymap, |a| is_switch_to(a, InputMode::RenamePane)),
+                "name pane",
+            );
+            hint(
+                &mut parts,
                 keys_starting_with(keymap, |a| {
                     matches!(a, Action::Run { command, .. }
                         if command.args.iter().any(|arg| arg.contains("rename-session")))
