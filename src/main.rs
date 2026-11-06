@@ -438,6 +438,29 @@ fn add_hint(parts: &mut Vec<Hint>, keys: &[KeyWithModifier], description: &str) 
     }
 }
 
+/// "1-9 go to" instead of "1|2|3|4|5|6|7|8|9 go to": plain digit keys are
+/// shown as a range, anything else falls back to the normal hint.
+fn add_digit_range_hint(parts: &mut Vec<Hint>, keys: &[KeyWithModifier], description: &str) {
+    let mut digits: Vec<u32> = keys
+        .iter()
+        .filter(|k| k.key_modifiers.is_empty())
+        .filter_map(|k| match k.bare_key {
+            BareKey::Char(c) => c.to_digit(10),
+            _ => None,
+        })
+        .collect();
+    digits.sort_unstable();
+    digits.dedup();
+    let contiguous = digits.windows(2).all(|w| w[1] == w[0] + 1);
+    match (digits.first(), digits.last()) {
+        (Some(first), Some(last)) if digits.len() > 2 && contiguous => parts.push(Hint {
+            keys: format!("{}-{}", first, last),
+            description: description.to_string(),
+        }),
+        _ => add_hint(parts, keys, description),
+    }
+}
+
 /// Keep a hint short: when an action has plain keys (no modifier), show only
 /// those - in a mode like "pane", `Alt n` next to `n` is just noise. Direction
 /// keys are put in ←↓↑→hjkl order so they collapse into one compact group.
@@ -574,6 +597,19 @@ fn render_hints_for_mode(mode: InputMode, keymap: &Keymap) -> Vec<Hint> {
                 focus_keys = vec![left, right];
             }
             hint(&mut parts, focus_keys, "move");
+            add_digit_range_hint(
+                &mut parts,
+                &keys_starting_with(keymap, |a| matches!(a, Action::GoToTab { .. })),
+                "go to",
+            );
+            let mut break_keys = keys_starting_with(keymap, |a| matches!(a, Action::BreakPaneLeft));
+            break_keys.extend(keys_starting_with(keymap, |a| matches!(a, Action::BreakPaneRight)));
+            hint(&mut parts, break_keys, "break ←→");
+            hint(
+                &mut parts,
+                keys_for(keymap, |a| matches!(a, Action::ToggleTab)),
+                "last",
+            );
             hint(&mut parts, select_keys, "select");
         }
         InputMode::Resize => {
