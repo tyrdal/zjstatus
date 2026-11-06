@@ -503,6 +503,7 @@ fn render_hints_for_mode(mode: InputMode, keymap: &Keymap) -> Vec<Hint> {
                 (InputMode::Scroll, "scroll"),
                 (InputMode::Search, "search"),
                 (InputMode::Session, "session"),
+                (InputMode::Locked, "lock"),
             ] {
                 hint(
                     &mut parts,
