@@ -1,5 +1,5 @@
 [tools]
-rust = "1.84.0"
+rust = "stable"
 
 [tasks.build]
 run = "cargo build --target=wasm32-wasip1"
