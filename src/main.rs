@@ -717,6 +717,63 @@ fn render_hints_for_mode(mode: InputMode, keymap: &Keymap) -> Vec<Hint> {
             }
             hint(&mut parts, select_keys, "select");
         }
+        InputMode::Tmux => {
+            // Most useful first: max_length drops hints from the end.
+            let new_pane = |dir: Direction| {
+                keys_starting_with(
+                    keymap,
+                    move |a| matches!(a, Action::NewPane { direction, .. } if *direction == Some(dir)),
+                )
+            };
+            hint(&mut parts, new_pane(Direction::Down), "split ↓");
+            hint(&mut parts, new_pane(Direction::Right), "split →");
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::FocusLastPane)),
+                "last",
+            );
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::ToggleFocusFullscreen)),
+                "zoom",
+            );
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::NewTab { .. })),
+                "new tab",
+            );
+            let mut tab_keys = keys_starting_with(keymap, |a| matches!(a, Action::GoToPreviousTab));
+            tab_keys.extend(keys_starting_with(keymap, |a| matches!(a, Action::GoToNextTab)));
+            hint(&mut parts, tab_keys, "tabs");
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| is_switch_to(a, InputMode::Scroll)),
+                "copy",
+            );
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| is_switch_to(a, InputMode::RenameTab)),
+                "name tab",
+            );
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| {
+                    matches!(a, Action::Run { command, .. }
+                        if command.args.iter().any(|arg| arg.contains("rename-session")))
+                }),
+                "name session",
+            );
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::FocusNextPane)),
+                "cycle",
+            );
+            hint(
+                &mut parts,
+                keys_starting_with(keymap, |a| matches!(a, Action::NextSwapLayout)),
+                "layout",
+            );
+        }
         _ => {
             let keys = keys_for(keymap, |a| is_switch_to(a, InputMode::Normal));
             hint(&mut parts, keys, "normal");
