@@ -3,7 +3,6 @@ name = "zjstatus-hints"
 version = "0.1.4"
 edition = "2021"
 license = "MIT"
-rust-version = "stable"
 
 [dependencies]
 zellij-tile = "0.45.1"
