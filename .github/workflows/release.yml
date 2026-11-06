@@ -6,6 +6,9 @@ on:
       - "v*.*.*"
   workflow_dispatch:
 
+permissions:
+  contents: write # create the release and upload the .wasm
+
 jobs:
   build-release:
     name: build-release
@@ -32,22 +35,13 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target=wasm32-wasip1
 
-      - name: Generate a changelog
-        uses: orhun/git-cliff-action@d77b37db2e3f7398432d34b72a12aa3e2ba87e51 # v3
-        id: git-cliff
-        with:
-          config: cliff.toml
-          args: -vv --latest --strip header
-        env:
-          OUTPUT: CHANGES.md
-
       - name: Create release
         uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          draft: true
-          body: ${{ steps.git-cliff.outputs.content }}
+          draft: false
+          generate_release_notes: true
           prerelease: false
           files: |
             ./target/wasm32-wasip1/release/zjstatus-hints.wasm
