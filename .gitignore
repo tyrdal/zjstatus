@@ -33,3 +33,6 @@ Cargo.lock
 *.pdb
 
 # End of https://www.toptal.com/developers/gitignore/api/rust,linux
+
+# Neovim project-local ShaDa file
+.local.shada
